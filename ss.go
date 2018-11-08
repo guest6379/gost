@@ -97,13 +97,20 @@ type shadowHandler struct {
 
 // ShadowHandler creates a server Handler for shadowsocks proxy server.
 func ShadowHandler(opts ...HandlerOption) Handler {
-	h := &shadowHandler{
-		options: &HandlerOptions{},
+	h := &shadowHandler{}
+	h.Init(opts...)
+
+	return h
+}
+
+func (h *shadowHandler) Init(options ...HandlerOption) {
+	if h.options == nil {
+		h.options = &HandlerOptions{}
 	}
-	for _, opt := range opts {
+
+	for _, opt := range options {
 		opt(h.options)
 	}
-	return h
 }
 
 func (h *shadowHandler) Handle(conn net.Conn) {
@@ -124,11 +131,15 @@ func (h *shadowHandler) Handle(conn net.Conn) {
 
 	log.Logf("[ss] %s - %s", conn.RemoteAddr(), conn.LocalAddr())
 
+	conn.SetReadDeadline(time.Now().Add(ReadTimeout))
 	addr, err := h.getRequest(conn)
 	if err != nil {
 		log.Logf("[ss] %s - %s : %s", conn.RemoteAddr(), conn.LocalAddr(), err)
 		return
 	}
+	// clear timer
+	conn.SetReadDeadline(time.Time{})
+
 	log.Logf("[ss] %s -> %s", conn.RemoteAddr(), addr)
 
 	if !Can("tcp", addr, h.options.Whitelist, h.options.Blacklist) {
@@ -136,7 +147,17 @@ func (h *shadowHandler) Handle(conn net.Conn) {
 		return
 	}
 
-	cc, err := h.options.Chain.Dial(addr)
+	if h.options.Bypass.Contains(addr) {
+		log.Logf("[ss] [bypass] %s", addr)
+		return
+	}
+
+	cc, err := h.options.Chain.Dial(addr,
+		RetryChainOption(h.options.Retries),
+		TimeoutChainOption(h.options.Timeout),
+		HostsChainOption(h.options.Hosts),
+		ResolverChainOption(h.options.Resolver),
+	)
 	if err != nil {
 		log.Logf("[ss] %s -> %s : %s", conn.RemoteAddr(), addr, err)
 		return
@@ -165,19 +186,16 @@ const (
 )
 
 // This function is copied from shadowsocks library with some modification.
-func (h *shadowHandler) getRequest(conn net.Conn) (host string, err error) {
+func (h *shadowHandler) getRequest(r io.Reader) (host string, err error) {
 	// buf size should at least have the same size with the largest possible
 	// request size (when addrType is 3, domain name has at most 256 bytes)
 	// 1(addrType) + 1(lenByte) + 256(max length address) + 2(port)
 	buf := make([]byte, smallBufferSize)
 
 	// read till we get possible domain length field
-	conn.SetReadDeadline(time.Now().Add(ReadTimeout))
-	if _, err = io.ReadFull(conn, buf[:idType+1]); err != nil {
+	if _, err = io.ReadFull(r, buf[:idType+1]); err != nil {
 		return
 	}
-	// clear timer
-	conn.SetReadDeadline(time.Time{})
 
 	var reqStart, reqEnd int
 	addrType := buf[idType]
@@ -187,16 +205,16 @@ func (h *shadowHandler) getRequest(conn net.Conn) (host string, err error) {
 	case typeIPv6:
 		reqStart, reqEnd = idIP0, idIP0+lenIPv6
 	case typeDm:
-		if _, err = io.ReadFull(conn, buf[idType+1:idDmLen+1]); err != nil {
+		if _, err = io.ReadFull(r, buf[idType+1:idDmLen+1]); err != nil {
 			return
 		}
-		reqStart, reqEnd = idDm0, int(idDm0+buf[idDmLen]+lenDmBase)
+		reqStart, reqEnd = idDm0, idDm0+int(buf[idDmLen])+lenDmBase
 	default:
 		err = fmt.Errorf("addr type %d not supported", addrType&ss.AddrMask)
 		return
 	}
 
-	if _, err = io.ReadFull(conn, buf[reqStart:reqEnd]); err != nil {
+	if _, err = io.ReadFull(r, buf[reqStart:reqEnd]); err != nil {
 		return
 	}
 
@@ -209,7 +227,7 @@ func (h *shadowHandler) getRequest(conn net.Conn) (host string, err error) {
 	case typeIPv6:
 		host = net.IP(buf[idIP0 : idIP0+net.IPv6len]).String()
 	case typeDm:
-		host = string(buf[idDm0 : idDm0+buf[idDmLen]])
+		host = string(buf[idDm0 : idDm0+int(buf[idDmLen])])
 	}
 	// parse port
 	port := binary.BigEndian.Uint16(buf[reqEnd-2 : reqEnd])
@@ -320,13 +338,20 @@ type shadowUDPdHandler struct {
 
 // ShadowUDPdHandler creates a server Handler for shadowsocks UDP relay server.
 func ShadowUDPdHandler(opts ...HandlerOption) Handler {
-	h := &shadowUDPdHandler{
-		options: &HandlerOptions{},
+	h := &shadowUDPdHandler{}
+	h.Init(opts...)
+
+	return h
+}
+
+func (h *shadowUDPdHandler) Init(options ...HandlerOption) {
+	if h.options == nil {
+		h.options = &HandlerOptions{}
 	}
-	for _, opt := range opts {
+
+	for _, opt := range options {
 		opt(h.options)
 	}
-	return h
 }
 
 func (h *shadowUDPdHandler) Handle(conn net.Conn) {
@@ -352,11 +377,11 @@ func (h *shadowUDPdHandler) Handle(conn net.Conn) {
 	defer cc.Close()
 
 	log.Logf("[ssu] %s <-> %s", conn.RemoteAddr(), conn.LocalAddr())
-	transportUDP(conn, cc)
+	h.transportUDP(conn, cc)
 	log.Logf("[ssu] %s >-< %s", conn.RemoteAddr(), conn.LocalAddr())
 }
 
-func transportUDP(sc net.Conn, cc net.PacketConn) error {
+func (h *shadowUDPdHandler) transportUDP(sc net.Conn, cc net.PacketConn) error {
 	errc := make(chan error, 1)
 	go func() {
 		for {
@@ -373,13 +398,17 @@ func transportUDP(sc net.Conn, cc net.PacketConn) error {
 				errc <- err
 				return
 			}
-			//if Debug {
-			//	log.Logf("[ssu] %s >>> %s length: %d", sc.RemoteAddr(), dgram.Header.Addr.String(), len(dgram.Data))
-			//}
+			if Debug {
+				log.Logf("[ssu] %s >>> %s length: %d", sc.RemoteAddr(), dgram.Header.Addr.String(), len(dgram.Data))
+			}
 			addr, err := net.ResolveUDPAddr("udp", dgram.Header.Addr.String())
 			if err != nil {
 				errc <- err
 				return
+			}
+			if h.options.Bypass.Contains(addr.String()) {
+				log.Log("[ssu] [bypass] write to", addr)
+				continue // bypass
 			}
 			if _, err := cc.WriteTo(dgram.Data, addr); err != nil {
 				errc <- err
@@ -396,9 +425,13 @@ func transportUDP(sc net.Conn, cc net.PacketConn) error {
 				errc <- err
 				return
 			}
-			//if Debug {
-			//	log.Logf("[ssu] %s <<< %s length: %d", sc.RemoteAddr(), addr, n)
-			//}
+			if Debug {
+				log.Logf("[ssu] %s <<< %s length: %d", sc.RemoteAddr(), addr, n)
+			}
+			if h.options.Bypass.Contains(addr.String()) {
+				log.Log("[ssu] [bypass] read from", addr)
+				continue // bypass
+			}
 			dgram := gosocks5.NewUDPDatagram(gosocks5.NewUDPHeader(0, 0, toSocksAddr(addr)), b[:n])
 			buf := bytes.Buffer{}
 			dgram.Write(&buf)

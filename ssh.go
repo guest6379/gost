@@ -168,10 +168,6 @@ func (tr *sshForwardTransporter) Handshake(conn net.Conn, options ...HandshakeOp
 	defer tr.sessionMutex.Unlock()
 
 	session, ok := tr.sessions[opts.Addr]
-	if session != nil && session.conn != conn {
-		conn.Close()
-		return nil, errors.New("ssh: unrecognized connection")
-	}
 	if !ok || session.client == nil {
 		sshConn, chans, reqs, err := ssh.NewClientConn(conn, opts.Addr, &config)
 		if err != nil {
@@ -189,7 +185,7 @@ func (tr *sshForwardTransporter) Handshake(conn net.Conn, options ...HandshakeOp
 			connChan: make(chan net.Conn, 1024),
 		}
 		tr.sessions[opts.Addr] = session
-		go session.Ping(opts.Interval, opts.Timeout, 1)
+		go session.Ping(opts.Interval, opts.Timeout, opts.Retry)
 		go session.waitServer()
 		go session.waitClose()
 	}
@@ -268,10 +264,6 @@ func (tr *sshTunnelTransporter) Handshake(conn net.Conn, options ...HandshakeOpt
 	defer tr.sessionMutex.Unlock()
 
 	session, ok := tr.sessions[opts.Addr]
-	if session != nil && session.conn != conn {
-		conn.Close()
-		return nil, errors.New("ssh: unrecognized connection")
-	}
 	if !ok || session.client == nil {
 		sshConn, chans, reqs, err := ssh.NewClientConn(conn, opts.Addr, &config)
 		if err != nil {
@@ -288,7 +280,7 @@ func (tr *sshTunnelTransporter) Handshake(conn net.Conn, options ...HandshakeOpt
 			deaded: make(chan struct{}),
 		}
 		tr.sessions[opts.Addr] = session
-		go session.Ping(opts.Interval, 30*time.Second, 1)
+		go session.Ping(opts.Interval, opts.Timeout, opts.Retry)
 		go session.waitServer()
 		go session.waitClose()
 	}
@@ -325,11 +317,16 @@ func (s *sshSession) Ping(interval, timeout time.Duration, retries int) {
 		return
 	}
 	if timeout <= 0 {
-		timeout = 0
+		timeout = 10 * time.Second
 	}
+
+	if retries == 0 {
+		retries = 1
+	}
+
 	defer close(s.deaded)
 
-	log.Log("[ssh] ping is enabled, interval:", interval)
+	log.Logf("[ssh] ping is enabled, interval: %v, timeout: %v, retry: %d", interval, timeout, retries)
 	baseCtx := context.Background()
 	t := time.NewTicker(interval)
 	defer t.Stop()
@@ -411,13 +408,22 @@ type sshForwardHandler struct {
 
 // SSHForwardHandler creates a server Handler for SSH port forwarding server.
 func SSHForwardHandler(opts ...HandlerOption) Handler {
-	h := &sshForwardHandler{
-		options: new(HandlerOptions),
-		config:  new(ssh.ServerConfig),
+	h := &sshForwardHandler{}
+	h.Init(opts...)
+
+	return h
+}
+
+func (h *sshForwardHandler) Init(options ...HandlerOption) {
+	if h.options == nil {
+		h.options = &HandlerOptions{}
 	}
-	for _, opt := range opts {
+
+	for _, opt := range options {
 		opt(h.options)
 	}
+	h.config = &ssh.ServerConfig{}
+
 	h.config.PasswordCallback = defaultSSHPasswordCallback(h.options.Users...)
 	if len(h.options.Users) == 0 {
 		h.config.NoClientAuth = true
@@ -433,8 +439,6 @@ func SSHForwardHandler(opts ...HandlerOption) Handler {
 		}
 		h.config.AddHostKey(signer)
 	}
-
-	return h
 }
 
 func (h *sshForwardHandler) Handle(conn net.Conn) {
@@ -461,7 +465,7 @@ func (h *sshForwardHandler) handleForward(conn ssh.Conn, chans <-chan ssh.NewCha
 			case RemoteForwardRequest:
 				go h.tcpipForwardRequest(conn, req, quit)
 			default:
-				// log.Log("[ssh] unknown channel type:", req.Type)
+				// log.Log("[ssh] unknown request type:", req.Type, req.WantReply)
 				if req.WantReply {
 					req.Reply(false, nil)
 				}
@@ -509,7 +513,17 @@ func (h *sshForwardHandler) directPortForwardChannel(channel ssh.Channel, raddr 
 		return
 	}
 
-	conn, err := h.options.Chain.Dial(raddr)
+	if h.options.Bypass.Contains(raddr) {
+		log.Logf("[ssh-tcp] [bypass] %s", raddr)
+		return
+	}
+
+	conn, err := h.options.Chain.Dial(raddr,
+		RetryChainOption(h.options.Retries),
+		TimeoutChainOption(h.options.Timeout),
+		HostsChainOption(h.options.Hosts),
+		ResolverChainOption(h.options.Resolver),
+	)
 	if err != nil {
 		log.Logf("[ssh-tcp] %s - %s : %s", h.options.Addr, raddr, err)
 		return
@@ -833,13 +847,13 @@ func (c *sshConn) RemoteAddr() net.Addr {
 }
 
 func (c *sshConn) SetDeadline(t time.Time) error {
-	return &net.OpError{Op: "set", Net: "ssh", Source: nil, Addr: nil, Err: errors.New("deadline not supported")}
+	return nil
 }
 
 func (c *sshConn) SetReadDeadline(t time.Time) error {
-	return &net.OpError{Op: "set", Net: "ssh", Source: nil, Addr: nil, Err: errors.New("deadline not supported")}
+	return nil
 }
 
 func (c *sshConn) SetWriteDeadline(t time.Time) error {
-	return &net.OpError{Op: "set", Net: "ssh", Source: nil, Addr: nil, Err: errors.New("deadline not supported")}
+	return nil
 }
